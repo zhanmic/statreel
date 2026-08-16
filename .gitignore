@@ -7,3 +7,9 @@ out
 data/*.sqlite
 data/*.sqlite-*
 *.log
+.vercel
+.env
+.env.local
+.env*.local
+.agents/
+skills-lock.json
