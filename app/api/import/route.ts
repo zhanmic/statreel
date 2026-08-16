@@ -26,7 +26,7 @@ export async function POST(request: Request) {
     String(form.get("title") ?? "").trim() ||
     file.name.replace(/\.csv$/i, "") ||
     "Imported CSV";
-  const dataset = upsertDataset({
+  const dataset = await upsertDataset({
     title,
     mode,
     unit: String(form.get("unit") ?? ""),

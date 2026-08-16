@@ -8,7 +8,7 @@ export async function GET(
   context: { params: Promise<{ id: string }> },
 ) {
   const { id } = await context.params;
-  const dataset = getDataset(id);
+  const dataset = await getDataset(id);
   if (!dataset) {
     return NextResponse.json({ error: "Dataset not found" }, { status: 404 });
   }
@@ -20,7 +20,7 @@ export async function DELETE(
   context: { params: Promise<{ id: string }> },
 ) {
   const { id } = await context.params;
-  const ok = deleteDataset(id);
+  const ok = await deleteDataset(id);
   if (!ok) {
     return NextResponse.json({ error: "Dataset not found" }, { status: 404 });
   }

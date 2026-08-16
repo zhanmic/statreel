@@ -4,8 +4,13 @@ import type { DatasetMode } from "@/lib/types";
 
 export const runtime = "nodejs";
 
-export function GET() {
-  return NextResponse.json({ datasets: listDatasets() });
+export async function GET() {
+  try {
+    return NextResponse.json({ datasets: await listDatasets() });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Database unavailable";
+    return NextResponse.json({ error: message }, { status: 503 });
+  }
 }
 
 export async function POST(request: Request) {
@@ -24,7 +29,7 @@ export async function POST(request: Request) {
       { status: 400 },
     );
   }
-  const dataset = upsertDataset({
+  const dataset = await upsertDataset({
     title: body.title.trim(),
     mode: body.mode === "compare" ? "compare" : "rank",
     unit: body.unit,

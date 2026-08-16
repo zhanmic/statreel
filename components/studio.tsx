@@ -28,7 +28,10 @@ export function Studio() {
 
   async function refreshList(selectId?: string) {
     const res = await fetch("/api/datasets");
-    const json = (await res.json()) as { datasets: DatasetSummary[] };
+    const json = (await res.json()) as { datasets?: DatasetSummary[]; error?: string };
+    if (!res.ok || !json.datasets) {
+      throw new Error(json.error || "Could not load datasets");
+    }
     setDatasets(json.datasets);
     const id = selectId ?? json.datasets[0]?.id;
     if (id) await loadDataset(id);

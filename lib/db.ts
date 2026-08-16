@@ -1,20 +1,39 @@
-import { mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 import { SEEDS } from "./seeds";
 import type { Dataset, DatasetMode, DatasetSummary } from "./types";
 
-const DB_PATH = join(process.cwd(), "data", "statreel.sqlite");
+type Sql = NeonQueryFunction<false, false>;
 
-let db: DatabaseSync | null = null;
+let sql: Sql | null = null;
+let ready: Promise<void> | null = null;
 
-function getDb(): DatabaseSync {
-  if (db) return db;
-  mkdirSync(dirname(DB_PATH), { recursive: true });
-  db = new DatabaseSync(DB_PATH);
-  db.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA foreign_keys = ON;
+function databaseUrl(): string {
+  const url =
+    process.env.DATABASE_URL?.trim() ||
+    process.env.POSTGRES_URL?.trim() ||
+    process.env.POSTGRES_PRISMA_URL?.trim();
+  if (!url) {
+    throw new Error(
+      "DATABASE_URL is required. In Vercel: Storage → Create Database → Neon. Locally: copy the Neon URI into .env.local.",
+    );
+  }
+  return url;
+}
+
+function getSql(): Sql {
+  if (!sql) sql = neon(databaseUrl());
+  return sql;
+}
+
+async function ensureDb(): Promise<Sql> {
+  const client = getSql();
+  if (!ready) ready = initSchema(client);
+  await ready;
+  return client;
+}
+
+async function initSchema(client: Sql) {
+  await client`
     CREATE TABLE IF NOT EXISTS datasets (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
@@ -25,49 +44,36 @@ function getDb(): DatabaseSync {
       year INTEGER,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
-    );
+    )
+  `;
+  await client`
     CREATE TABLE IF NOT EXISTS items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      dataset_id TEXT NOT NULL,
+      id SERIAL PRIMARY KEY,
+      dataset_id TEXT NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
       label TEXT NOT NULL,
-      value REAL NOT NULL,
+      value DOUBLE PRECISION NOT NULL,
       color TEXT,
-      sort_order INTEGER NOT NULL DEFAULT 0,
-      FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE
-    );
-  `);
-  seedIfEmpty(db);
-  return db;
-}
+      sort_order INTEGER NOT NULL DEFAULT 0
+    )
+  `;
+  const counted = await client`SELECT COUNT(*)::int AS n FROM datasets`;
+  if (Number(counted[0]?.n) > 0) return;
 
-function seedIfEmpty(database: DatabaseSync) {
-  const row = database.prepare("SELECT COUNT(*) AS n FROM datasets").get() as {
-    n: number;
-  };
-  if (row.n > 0) return;
   const now = new Date().toISOString();
-  const insertDataset = database.prepare(
-    `INSERT INTO datasets (id, title, mode, unit, source, source_url, year, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-  const insertItem = database.prepare(
-    `INSERT INTO items (dataset_id, label, value, color, sort_order) VALUES (?, ?, ?, ?, ?)`,
-  );
   for (const seed of SEEDS) {
-    insertDataset.run(
-      seed.id,
-      seed.title,
-      seed.mode,
-      seed.unit,
-      seed.source,
-      seed.sourceUrl,
-      seed.year,
-      now,
-      now,
-    );
-    seed.items.forEach((item, index) => {
-      insertItem.run(seed.id, item.label, item.value, item.color ?? null, index);
-    });
+    await client`
+      INSERT INTO datasets (id, title, mode, unit, source, source_url, year, created_at, updated_at)
+      VALUES (
+        ${seed.id}, ${seed.title}, ${seed.mode}, ${seed.unit},
+        ${seed.source}, ${seed.sourceUrl}, ${seed.year}, ${now}, ${now}
+      )
+    `;
+    for (const [index, item] of seed.items.entries()) {
+      await client`
+        INSERT INTO items (dataset_id, label, value, color, sort_order)
+        VALUES (${seed.id}, ${item.label}, ${item.value}, ${item.color ?? null}, ${index})
+      `;
+    }
   }
 }
 
@@ -85,29 +91,28 @@ function mapDataset(row: Record<string, unknown>): Omit<Dataset, "items"> {
   };
 }
 
-export function listDatasets(): DatasetSummary[] {
-  const rows = getDb()
-    .prepare(
-      `SELECT d.*, (SELECT COUNT(*) FROM items i WHERE i.dataset_id = d.id) AS item_count
-       FROM datasets d ORDER BY d.updated_at DESC`,
-    )
-    .all() as Record<string, unknown>[];
+export async function listDatasets(): Promise<DatasetSummary[]> {
+  const client = await ensureDb();
+  const rows = await client`
+    SELECT d.*, (SELECT COUNT(*) FROM items i WHERE i.dataset_id = d.id)::int AS item_count
+    FROM datasets d
+    ORDER BY d.updated_at DESC
+  `;
   return rows.map((row) => ({
-    ...mapDataset(row),
+    ...mapDataset(row as Record<string, unknown>),
     itemCount: Number(row.item_count),
   }));
 }
 
-export function getDataset(id: string): Dataset | null {
-  const row = getDb()
-    .prepare("SELECT * FROM datasets WHERE id = ?")
-    .get(id) as Record<string, unknown> | undefined;
+export async function getDataset(id: string): Promise<Dataset | null> {
+  const client = await ensureDb();
+  const rows = await client`SELECT * FROM datasets WHERE id = ${id}`;
+  const row = rows[0] as Record<string, unknown> | undefined;
   if (!row) return null;
-  const items = getDb()
-    .prepare(
-      "SELECT * FROM items WHERE dataset_id = ? ORDER BY sort_order ASC, value DESC",
-    )
-    .all(id) as Record<string, unknown>[];
+  const items = await client`
+    SELECT * FROM items WHERE dataset_id = ${id}
+    ORDER BY sort_order ASC, value DESC
+  `;
   return {
     ...mapDataset(row),
     items: items.map((item) => ({
@@ -121,12 +126,13 @@ export function getDataset(id: string): Dataset | null {
   };
 }
 
-export function deleteDataset(id: string): boolean {
-  const result = getDb().prepare("DELETE FROM datasets WHERE id = ?").run(id);
-  return Number(result.changes) > 0;
+export async function deleteDataset(id: string): Promise<boolean> {
+  const client = await ensureDb();
+  const result = await client`DELETE FROM datasets WHERE id = ${id} RETURNING id`;
+  return result.length > 0;
 }
 
-export function upsertDataset(input: {
+export async function upsertDataset(input: {
   id?: string;
   title: string;
   mode: DatasetMode;
@@ -135,58 +141,44 @@ export function upsertDataset(input: {
   sourceUrl?: string;
   year?: number | null;
   items: { label: string; value: number; color?: string | null }[];
-}): Dataset {
-  const database = getDb();
+}): Promise<Dataset> {
+  const client = await ensureDb();
   const id = input.id ?? `ds-${crypto.randomUUID()}`;
   const now = new Date().toISOString();
-  const existing = database
-    .prepare("SELECT created_at FROM datasets WHERE id = ?")
-    .get(id) as { created_at: string } | undefined;
+  const existing = await client`SELECT created_at FROM datasets WHERE id = ${id}`;
 
-  if (existing) {
-    database
-      .prepare(
-        `UPDATE datasets SET title = ?, mode = ?, unit = ?, source = ?, source_url = ?, year = ?, updated_at = ?
-         WHERE id = ?`,
-      )
-      .run(
-        input.title,
-        input.mode,
-        input.unit ?? "",
-        input.source ?? "",
-        input.sourceUrl ?? "",
-        input.year ?? null,
-        now,
-        id,
-      );
-    database.prepare("DELETE FROM items WHERE dataset_id = ?").run(id);
+  if (existing[0]) {
+    await client`
+      UPDATE datasets
+      SET title = ${input.title},
+          mode = ${input.mode},
+          unit = ${input.unit ?? ""},
+          source = ${input.source ?? ""},
+          source_url = ${input.sourceUrl ?? ""},
+          year = ${input.year ?? null},
+          updated_at = ${now}
+      WHERE id = ${id}
+    `;
+    await client`DELETE FROM items WHERE dataset_id = ${id}`;
   } else {
-    database
-      .prepare(
-        `INSERT INTO datasets (id, title, mode, unit, source, source_url, year, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    await client`
+      INSERT INTO datasets (id, title, mode, unit, source, source_url, year, created_at, updated_at)
+      VALUES (
+        ${id}, ${input.title}, ${input.mode}, ${input.unit ?? ""},
+        ${input.source ?? ""}, ${input.sourceUrl ?? ""}, ${input.year ?? null},
+        ${now}, ${now}
       )
-      .run(
-        id,
-        input.title,
-        input.mode,
-        input.unit ?? "",
-        input.source ?? "",
-        input.sourceUrl ?? "",
-        input.year ?? null,
-        now,
-        now,
-      );
+    `;
   }
 
-  const insertItem = database.prepare(
-    `INSERT INTO items (dataset_id, label, value, color, sort_order) VALUES (?, ?, ?, ?, ?)`,
-  );
-  input.items.forEach((item, index) => {
-    insertItem.run(id, item.label, item.value, item.color ?? null, index);
-  });
+  for (const [index, item] of input.items.entries()) {
+    await client`
+      INSERT INTO items (dataset_id, label, value, color, sort_order)
+      VALUES (${id}, ${item.label}, ${item.value}, ${item.color ?? null}, ${index})
+    `;
+  }
 
-  const saved = getDataset(id);
+  const saved = await getDataset(id);
   if (!saved) throw new Error("Failed to save dataset");
   return saved;
 }
